@@ -2,22 +2,25 @@ name: Auto Apply Review Suggestions
 
 on:
   workflow_call:
+    inputs:
+      comment_body:
+        description: 'The review comment body to apply'
+        required: true
+        type: string
+      pr_number:
+        description: 'The PR number'
+        required: true
+        type: number
+      comment_user:
+        description: 'The user who made the comment'
+        required: true
+        type: string
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN:
         required: true
 
 jobs:
   apply-review:
-    # Condições para executar:
-    # 1. É um PR (não issue)
-    # 2. Comentário é do Claude bot
-    # 3. Contém "Pull Request Review" (é um review, não qualquer comentário)
-    if: |
-      github.event.issue.pull_request &&
-      (github.event.comment.user.login == 'github-actions[bot]' ||
-       github.event.comment.user.login == 'claude[bot]') &&
-      contains(github.event.comment.body, 'Pull Request Review')
-
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -34,7 +37,7 @@ jobs:
             const pr = await github.rest.pulls.get({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              pull_number: context.issue.number
+              pull_number: ${{ inputs.pr_number }}
             });
             core.setOutput('branch', pr.data.head.ref);
             return pr.data.head.ref;
@@ -47,10 +50,9 @@ jobs:
             const commits = await github.rest.pulls.listCommits({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              pull_number: context.issue.number
+              pull_number: ${{ inputs.pr_number }}
             });
 
-            // Conta commits com "[auto-fix]" na mensagem
             const autoFixCount = commits.data.filter(c =>
               c.commit.message.includes('[auto-fix]')
             ).length;
@@ -73,7 +75,7 @@ jobs:
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.issue.number,
+              issue_number: ${{ inputs.pr_number }},
               body: `🔄 **Auto-fix iteration ${process.env.ITERATION}/3** - Applying review suggestions...`
             });
         env:
@@ -104,7 +106,7 @@ jobs:
             ## The Review to Apply
 
             ```
-            ${{ github.event.comment.body }}
+            ${{ inputs.comment_body }}
             ```
 
             ## Instructions
@@ -154,6 +156,6 @@ jobs:
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.issue.number,
+              issue_number: ${{ inputs.pr_number }},
               body: `⚠️ **Auto-fix limit reached (3 iterations)**\n\nPlease review the remaining suggestions manually and merge when ready.`
             });

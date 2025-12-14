@@ -7,5 +7,19 @@ on:
 
 jobs:
   fix:
+    # Só executa se:
+    # 1. É um PR (não issue)
+    # 2. Comentário é do Claude bot
+    # 3. Contém "Pull Request Review"
+    if: |
+      github.event.issue.pull_request &&
+      (github.event.comment.user.login == 'github-actions[bot]' ||
+       github.event.comment.user.login == 'claude[bot]') &&
+      contains(github.event.comment.body, 'Pull Request Review')
+
     uses: mp3fbf/code-review/.github/workflows/auto-apply-review.yml@main
+    with:
+      comment_body: ${{ github.event.comment.body }}
+      pr_number: ${{ github.event.issue.number }}
+      comment_user: ${{ github.event.comment.user.login }}
     secrets: inherit
