@@ -1,26 +1,29 @@
+# Auto Apply Review Suggestions
+#
+# This workflow automatically applies Claude's code review suggestions.
+# It triggers when claude[bot] edits a comment to add the review content.
+#
+# How it works:
+# 1. Claude Code Review workflow runs on PR push
+# 2. claude-code-action creates a comment and later edits it with the review
+# 3. This workflow triggers on the edit when "Pull Request Review" appears
+# 4. Claude Code applies the suggestions and commits with [auto-fix] tag
+# 5. The push triggers step 1 again (loop until approval or 3 iterations)
+
 name: Auto Apply Review Suggestions
 
 on:
-  workflow_call:
-    inputs:
-      comment_body:
-        description: 'The review comment body to apply'
-        required: true
-        type: string
-      pr_number:
-        description: 'The PR number'
-        required: true
-        type: string
-      comment_user:
-        description: 'The user who made the comment'
-        required: true
-        type: string
-    secrets:
-      CLAUDE_CODE_OAUTH_TOKEN:
-        required: true
+  issue_comment:
+    types: [created, edited]  # claude-code-action EDITS the comment with the review
 
 jobs:
   apply-review:
+    # Triggers when Claude bot posts a completed review on a PR
+    if: |
+      github.event.issue.pull_request &&
+      github.event.comment.user.login == 'claude[bot]' &&
+      contains(github.event.comment.body, 'Claude finished') &&
+      contains(github.event.comment.body, 'Pull Request Review')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -37,10 +40,9 @@ jobs:
             const pr = await github.rest.pulls.get({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              pull_number: ${{ inputs.pr_number }}
+              pull_number: context.issue.number
             });
             core.setOutput('branch', pr.data.head.ref);
-            return pr.data.head.ref;
 
       - name: Check iteration count
         id: check-iterations
@@ -50,21 +52,17 @@ jobs:
             const commits = await github.rest.pulls.listCommits({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              pull_number: ${{ inputs.pr_number }}
+              pull_number: context.issue.number
             });
-
             const autoFixCount = commits.data.filter(c =>
               c.commit.message.includes('[auto-fix]')
             ).length;
-
-            console.log(`Auto-fix iterations so far: ${autoFixCount}`);
-
+            console.log('Auto-fix iterations:', autoFixCount);
             if (autoFixCount >= 3) {
               core.setOutput('should_continue', 'false');
-              core.notice('Max iterations (3) reached. Human review required.');
             } else {
               core.setOutput('should_continue', 'true');
-              core.setOutput('iteration', autoFixCount + 1);
+              core.setOutput('iteration', String(autoFixCount + 1));
             }
 
       - name: Post starting comment
@@ -72,14 +70,13 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
+            const iteration = '${{ steps.check-iterations.outputs.iteration }}';
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: ${{ inputs.pr_number }},
-              body: `🔄 **Auto-fix iteration ${process.env.ITERATION}/3** - Applying review suggestions...`
+              issue_number: context.issue.number,
+              body: '🔄 **Auto-fix iteration ' + iteration + '/3** - Applying review suggestions...'
             });
-        env:
-          ITERATION: ${{ steps.check-iterations.outputs.iteration }}
 
       - name: Checkout repository
         if: steps.check-iterations.outputs.should_continue == 'true'
@@ -87,7 +84,6 @@ jobs:
         with:
           ref: ${{ steps.pr-info.outputs.branch }}
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Configure git
         if: steps.check-iterations.outputs.should_continue == 'true'
@@ -100,53 +96,28 @@ jobs:
         uses: anthropics/claude-code-action@beta
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed_bots: "claude"  # Allow claude bot to trigger this action
           direct_prompt: |
-            You are applying code review suggestions automatically.
+            Apply the code review suggestions from the review comment on this PR.
 
-            ## The Review to Apply
+            Focus on fixing:
+            - Security issues (marked with warning symbols)
+            - Potential bugs (marked with bug symbols)
+            - Performance improvements that have code suggestions
 
-            ```
-            ${{ inputs.comment_body }}
-            ```
+            Skip:
+            - Items already marked as good/done
+            - Pure style suggestions
+            - Test recommendations
 
-            ## Instructions
-
-            1. **Parse the review** and identify actionable items:
-               - ⚠️ Security Considerations → MUST FIX
-               - 🔧 Potential Issues → MUST FIX
-               - 🚀 Performance Improvements → FIX if code is provided
-               - Code blocks with suggestions → Apply them
-
-            2. **For each actionable item:**
-               - Find the relevant file in the codebase
-               - Understand the context around the suggestion
-               - Apply the fix carefully
-               - If a code block is provided, use it as reference (adapt if needed)
-
-            3. **DO NOT apply:**
-               - Items already marked with ✅
-               - Pure recommendations without specific code
-               - Test suggestions (skip for now)
-               - Minor style/nit comments
-
-            4. **After all fixes:**
-               - Stage all changes: `git add -A`
-               - Commit with message: `fix: apply review suggestions [auto-fix]`
-               - Include a brief list of what was changed in the commit body
-
-            ## Important Rules
-            - Be conservative: only apply clear, unambiguous suggestions
-            - If you're unsure about a change, skip it
-            - Preserve existing code style
-            - Don't break existing functionality
-            - If no actionable items found, do NOT create a commit
-
-          allowed_tools: "Read,Edit,Write,Glob,Grep,Bash(git status),Bash(git add *),Bash(git commit *),Bash(git diff *),Bash(git push *)"
+            After applying fixes:
+            1. Stage changes: git add -A
+            2. Commit with message: fix: apply review suggestions [auto-fix]
+            3. Include brief list of what was fixed in commit body
 
       - name: Push changes
         if: steps.check-iterations.outputs.should_continue == 'true'
-        run: |
-          git push origin HEAD:${{ steps.pr-info.outputs.branch }} || echo "Nothing to push"
+        run: git push origin HEAD:${{ steps.pr-info.outputs.branch }} || echo "Nothing to push"
 
       - name: Comment if max iterations reached
         if: steps.check-iterations.outputs.should_continue == 'false'
@@ -156,6 +127,6 @@ jobs:
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: ${{ inputs.pr_number }},
-              body: `⚠️ **Auto-fix limit reached (3 iterations)**\n\nPlease review the remaining suggestions manually and merge when ready.`
+              issue_number: context.issue.number,
+              body: '⚠️ **Auto-fix limit reached (3 iterations)**\n\nPlease review manually.'
             });
