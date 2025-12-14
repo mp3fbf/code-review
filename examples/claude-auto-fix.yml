@@ -1,0 +1,11 @@
+# Copie este arquivo para .github/workflows/claude-auto-fix.yml no seu repo
+name: Claude Auto Fix
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  fix:
+    uses: mp3fbf/code-review/.github/workflows/auto-apply-review.yml@main
+    secrets: inherit
