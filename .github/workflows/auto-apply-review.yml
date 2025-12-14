@@ -10,7 +10,7 @@ on:
       pr_number:
         description: 'The PR number'
         required: true
-        type: number
+        type: string
       comment_user:
         description: 'The user who made the comment'
         required: true
