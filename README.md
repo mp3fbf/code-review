@@ -14,6 +14,17 @@ PR Push → Claude Reviews → Auto-Fix Applies → Push → Claude Reviews Agai
 4. New push triggers another review
 5. Loop stops when: all issues fixed OR 3 iterations reached
 
+## Observability
+
+The workflow provides clear feedback on every outcome:
+
+| Scenario | Comment Posted |
+|----------|----------------|
+| Review approved (no issues) | ✅ **Auto-fix: Review approved, no fixes needed** |
+| Applying fixes | 🔄 **Auto-fix iteration X/3** - Applying review suggestions... |
+| Analyzed but no changes | ✅ **Auto-fix: Analyzed, no changes needed** |
+| Max iterations reached | ⚠️ **Auto-fix limit reached (3 iterations)** |
+
 ## Setup (2 files needed)
 
 ### 1. Claude Code Review Workflow
@@ -66,11 +77,12 @@ on:
 
 jobs:
   apply-review:
+    # Matches both "Code Review" and "Pull Request Review" (output format varies)
     if: |
       github.event.issue.pull_request &&
       github.event.comment.user.login == 'claude[bot]' &&
       contains(github.event.comment.body, 'Claude finished') &&
-      contains(github.event.comment.body, 'Pull Request Review')
+      (contains(github.event.comment.body, 'Code Review') || contains(github.event.comment.body, 'Pull Request Review'))
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -187,8 +199,9 @@ jobs:
 | Problem | Solution |
 |---------|----------|
 | `claude-code-action` creates comment then edits it | Trigger on `issue_comment: [created, edited]` |
-| Initial comment has no review content | Check for both `"Claude finished"` AND `"Pull Request Review"` |
+| Initial comment has no review content | Check for `"Claude finished"` AND (`"Code Review"` OR `"Pull Request Review"`) |
 | Bot-triggered workflows blocked | Add `allowed_bots: "claude"` to BOTH workflows |
+| No visibility into what happened | Added observability comments for all outcomes |
 
 ## Example Output
 
