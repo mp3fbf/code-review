@@ -330,6 +330,8 @@ jobs:
       # AGREEMENT: Both reviewers agree
       # ═══════════════════════════════════════════════════════════════
 
+      # Security: This step uses actions/github-script (JavaScript, not shell).
+      # All values are from trusted step outputs, not user-controlled inputs.
       - name: Post consensus (both agree)
         if: steps.consensus.outputs.status == 'agree-approve' || steps.consensus.outputs.status == 'agree-issues'
         uses: actions/github-script@v7
@@ -338,42 +340,43 @@ jobs:
             const prNumber = ${{ steps.pr-number.outputs.number }};
             const status = '${{ steps.consensus.outputs.status }}';
             const p1Count = '${{ steps.codex-review.outputs.p1_count }}' || '0';
-            const p2Count = '${{ steps.codex-review.outputs.p2_count }}' || '0';
 
             const isApproval = status === 'agree-approve';
             const emoji = isApproval ? '✅' : '⚠️';
             const verdict = isApproval ? 'MERGE RECOMMENDED' : 'CHANGES REQUESTED';
+            const claudeVerdict = isApproval ? '✅ Approved' : '⚠️ Issues Found';
+            const codexVerdict = isApproval ? '✅ No P1 Issues' : '⚠️ ' + p1Count + ' P1 Issue(s)';
 
-            let body = `## ${emoji} AI Review Consensus: ${verdict}
-
-Both Claude (Anthropic) and Codex (OpenAI) have reviewed this PR.
-
-| Reviewer | Verdict |
-|----------|---------|
-| Claude | ${isApproval ? '✅ Approved' : '⚠️ Issues Found'} |
-| Codex | ${isApproval ? '✅ No P1 Issues' : '⚠️ ' + p1Count + ' P1 Issue(s)'} |
-
-`;
+            const bodyParts = [
+              '## ' + emoji + ' AI Review Consensus: ' + verdict,
+              '',
+              'Both Claude (Anthropic) and Codex (OpenAI) have reviewed this PR.',
+              '',
+              '| Reviewer | Verdict |',
+              '|----------|---------|',
+              '| Claude | ' + claudeVerdict + ' |',
+              '| Codex | ' + codexVerdict + ' |',
+              ''
+            ];
 
             if (isApproval) {
-              body += `**Both AI reviewers agree this PR is ready to merge.**`;
+              bodyParts.push('**Both AI reviewers agree this PR is ready to merge.**');
             } else {
-              body += `**Both AI reviewers found issues that should be addressed.**
-
-Please review the detailed comments from each reviewer above.`;
+              bodyParts.push('**Both AI reviewers found issues that should be addressed.**');
+              bodyParts.push('');
+              bodyParts.push('Please review the detailed comments from each reviewer above.');
             }
 
-            body += `
-
----
-*This is an automated consensus. Final merge decision is yours.*
-*To re-review: comment \`@claude review\` and/or \`@codex review\`*`;
+            bodyParts.push('');
+            bodyParts.push('---');
+            bodyParts.push('*This is an automated consensus. Final merge decision is yours.*');
+            bodyParts.push('*To re-review: comment \`@claude review\` and/or \`@codex review\`*');
 
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: prNumber,
-              body
+              body: bodyParts.join('\n')
             });
 
             // Remove any pending labels
