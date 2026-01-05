@@ -1,0 +1,433 @@
+# Consensus Review - Reusable Workflow
+#
+# This is the REUSABLE version of the consensus workflow.
+# Other repos should use ai-consensus-caller.yml to call this.
+#
+# Security: This workflow fetches all content via GitHub API.
+# No untrusted input is passed as workflow inputs.
+#
+# Usage in other repos:
+#   uses: mp3fbf/code-review/.github/workflows/consensus-reusable.yml@main
+
+name: Consensus Review (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      event_name:
+        description: 'The event name (issue_comment or pull_request_review)'
+        required: true
+        type: string
+      pr_number:
+        description: 'The PR number'
+        required: true
+        type: number
+      trigger_user:
+        description: 'The user that triggered the event (for filtering)'
+        required: true
+        type: string
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: false
+
+jobs:
+  consensus-check:
+    # Only run for AI bot reviews (filter by username only, content checked via API)
+    if: |
+      inputs.trigger_user == 'claude[bot]' ||
+      inputs.trigger_user == 'chatgpt-codex-connector[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+
+    outputs:
+      pr_number: ${{ inputs.pr_number }}
+      consensus_status: ${{ steps.consensus.outputs.status }}
+      claude_approves: ${{ steps.claude-review.outputs.approves }}
+      codex_approves: ${{ steps.codex-review.outputs.approves }}
+
+    steps:
+      # Security: Validate this is actually a bot review by checking content via API
+      - name: Validate trigger and check existing consensus
+        id: validate
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = ${{ inputs.pr_number }};
+            const eventName = '${{ inputs.event_name }}';
+            const triggerUser = '${{ inputs.trigger_user }}';
+
+            // Fetch comments to validate Claude trigger
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber
+            });
+
+            // Check for existing consensus
+            const existingConsensus = comments.data.find(c =>
+              c.user.login === 'github-actions[bot]' &&
+              c.body.includes('AI Review Consensus')
+            );
+
+            if (existingConsensus) {
+              console.log('Consensus already posted, skipping');
+              core.setOutput('skip', 'true');
+              return;
+            }
+
+            // Validate Claude trigger
+            if (eventName === 'issue_comment' && triggerUser === 'claude[bot]') {
+              const claudeComment = comments.data
+                .filter(c => c.user.login === 'claude[bot]')
+                .find(c => c.body.includes('Claude finished'));
+              if (!claudeComment) {
+                console.log('No valid Claude review comment found');
+                core.setOutput('skip', 'true');
+                return;
+              }
+            }
+
+            // Validate Codex trigger
+            if (eventName === 'pull_request_review' && triggerUser === 'chatgpt-codex-connector[bot]') {
+              const reviews = await github.rest.pulls.listReviews({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber
+              });
+              const codexReview = reviews.data
+                .filter(r => r.user.login === 'chatgpt-codex-connector[bot]')
+                .find(r => r.body && r.body.includes('Codex Review'));
+              if (!codexReview) {
+                console.log('No valid Codex review found');
+                core.setOutput('skip', 'true');
+                return;
+              }
+            }
+
+            core.setOutput('skip', 'false');
+
+      - name: Fetch Claude review
+        id: claude-review
+        if: steps.validate.outputs.skip == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = ${{ inputs.pr_number }};
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber
+            });
+
+            const claudeComments = comments.data
+              .filter(c => c.user.login === 'claude[bot]')
+              .filter(c => c.body.includes('Claude finished'));
+
+            const claudeComment = claudeComments[claudeComments.length - 1];
+
+            if (claudeComment) {
+              const body = claudeComment.body;
+
+              const isApproved = body.includes('APPROVED') ||
+                                body.includes('Recommendation: MERGE') ||
+                                body.includes('Overall Assessment: APPROVED') ||
+                                body.includes('Excellent Work');
+
+              const hasSecurityIssues = body.includes('🔒') && body.includes('ISSUE');
+              const hasBugs = body.includes('🐛') ||
+                             (body.includes('Potential bugs') && !body.includes('No issues'));
+              const hasWarnings = body.includes('⚠️') && !body.includes('Auto-fix limit');
+              const hasIssues = hasSecurityIssues || hasBugs || hasWarnings;
+
+              core.setOutput('found', 'true');
+              core.setOutput('approves', isApproved && !hasIssues ? 'true' : 'false');
+            } else {
+              core.setOutput('found', 'false');
+            }
+
+      - name: Fetch Codex review
+        id: codex-review
+        if: steps.validate.outputs.skip == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = ${{ inputs.pr_number }};
+            const reviews = await github.rest.pulls.listReviews({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber
+            });
+
+            const codexReview = reviews.data
+              .filter(r => r.user.login === 'chatgpt-codex-connector[bot]')
+              .filter(r => r.body && r.body.includes('Codex Review'))
+              .pop();
+
+            if (codexReview) {
+              const body = codexReview.body;
+              const p1Count = (body.match(/!\[P1 Badge\]/g) || []).length;
+
+              // Check inline comments too
+              const prComments = await github.rest.pulls.listReviewComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber
+              });
+
+              let inlineP1 = 0;
+              for (const c of prComments.data.filter(c => c.user.login === 'chatgpt-codex-connector[bot]')) {
+                if (c.body.includes('![P1 Badge]')) inlineP1++;
+              }
+
+              const totalP1 = p1Count + inlineP1;
+              core.setOutput('found', 'true');
+              core.setOutput('approves', totalP1 === 0 ? 'true' : 'false');
+              core.setOutput('p1_count', String(totalP1));
+            } else {
+              core.setOutput('found', 'false');
+            }
+
+      - name: Check for Codex 👀 reaction
+        id: codex-started
+        if: steps.validate.outputs.skip == 'false' && steps.codex-review.outputs.found == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = ${{ inputs.pr_number }};
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber
+            });
+
+            let codexStarted = false;
+            for (const comment of comments.data) {
+              try {
+                const reactions = await github.rest.reactions.listForIssueComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: comment.id
+                });
+                if (reactions.data.some(r => r.user.login === 'chatgpt-codex-connector[bot]' && r.content === 'eyes')) {
+                  codexStarted = true;
+                  break;
+                }
+              } catch (e) {}
+            }
+            core.setOutput('started', codexStarted ? 'true' : 'false');
+
+      - name: Determine consensus status
+        id: consensus
+        if: steps.validate.outputs.skip == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const claudeFound = '${{ steps.claude-review.outputs.found }}' === 'true';
+            const codexFound = '${{ steps.codex-review.outputs.found }}' === 'true';
+            const claudeApproves = '${{ steps.claude-review.outputs.approves }}' === 'true';
+            const codexApproves = '${{ steps.codex-review.outputs.approves }}' === 'true';
+            const codexStarted = '${{ steps.codex-started.outputs.started }}' === 'true';
+
+            if (!claudeFound && !codexFound) {
+              core.setOutput('status', 'no-reviews');
+              return;
+            }
+
+            if (!claudeFound || !codexFound) {
+              core.setOutput('status', 'pending');
+              core.setOutput('missing', !claudeFound ? 'claude' : 'codex');
+              core.setOutput('codex_started', codexStarted ? 'true' : 'false');
+              return;
+            }
+
+            if (claudeApproves && codexApproves) {
+              core.setOutput('status', 'agree-approve');
+            } else if (!claudeApproves && !codexApproves) {
+              core.setOutput('status', 'agree-issues');
+            } else {
+              core.setOutput('status', 'disagree');
+            }
+
+      - name: Add pending label
+        if: steps.consensus.outputs.status == 'pending'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = ${{ inputs.pr_number }};
+            const missing = '${{ steps.consensus.outputs.missing }}';
+            const codexStarted = '${{ steps.consensus.outputs.codex_started }}' === 'true';
+
+            const labelSuffix = missing === 'codex'
+              ? (codexStarted ? 'codex-processing' : 'codex-not-started')
+              : 'claude';
+            const labelName = 'awaiting-ai-consensus-' + labelSuffix;
+
+            const { data: labels } = await github.rest.issues.listLabelsOnIssue({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber
+            });
+
+            if (!labels.some(l => l.name.startsWith('awaiting-ai-consensus'))) {
+              try {
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: labelName,
+                  color: 'fbca04'
+                });
+              } catch (e) {}
+
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                labels: [labelName]
+              });
+            }
+
+      - name: Post consensus (both agree)
+        if: steps.consensus.outputs.status == 'agree-approve' || steps.consensus.outputs.status == 'agree-issues'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = ${{ inputs.pr_number }};
+            const status = '${{ steps.consensus.outputs.status }}';
+            const p1Count = '${{ steps.codex-review.outputs.p1_count }}' || '0';
+
+            const isApproval = status === 'agree-approve';
+            const emoji = isApproval ? '✅' : '⚠️';
+            const verdict = isApproval ? 'MERGE RECOMMENDED' : 'CHANGES REQUESTED';
+            const claudeVerdict = isApproval ? '✅ Approved' : '⚠️ Issues Found';
+            const codexVerdict = isApproval ? '✅ No P1 Issues' : '⚠️ ' + p1Count + ' P1 Issue(s)';
+
+            const bodyParts = [
+              '## ' + emoji + ' AI Review Consensus: ' + verdict,
+              '',
+              'Both Claude (Anthropic) and Codex (OpenAI) have reviewed this PR.',
+              '',
+              '| Reviewer | Verdict |',
+              '|----------|---------|',
+              '| Claude | ' + claudeVerdict + ' |',
+              '| Codex | ' + codexVerdict + ' |',
+              ''
+            ];
+
+            if (isApproval) {
+              bodyParts.push('**Both AI reviewers agree this PR is ready to merge.**');
+            } else {
+              bodyParts.push('**Both AI reviewers found issues that should be addressed.**');
+              bodyParts.push('');
+              bodyParts.push('Please review the detailed comments from each reviewer above.');
+            }
+
+            bodyParts.push('');
+            bodyParts.push('---');
+            bodyParts.push('*This is an automated consensus. Final merge decision is yours.*');
+            bodyParts.push('*To re-review: comment `@claude review` and/or `@codex review`*');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: bodyParts.join('\n')
+            });
+
+            // Remove pending labels
+            const { data: labels } = await github.rest.issues.listLabelsOnIssue({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber
+            });
+
+            for (const label of labels) {
+              if (label.name.startsWith('awaiting-ai-consensus')) {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  name: label.name
+                });
+              }
+            }
+
+  arbitrate:
+    needs: consensus-check
+    if: needs.consensus-check.outputs.consensus_status == 'disagree'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch reviews for arbitration
+        id: fetch-reviews
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = ${{ inputs.pr_number }};
+
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber
+            });
+
+            const claudeComment = comments.data
+              .filter(c => c.user.login === 'claude[bot]')
+              .filter(c => c.body.includes('Claude finished'))
+              .pop();
+
+            const reviews = await github.rest.pulls.listReviews({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber
+            });
+
+            const codexReview = reviews.data
+              .filter(r => r.user.login === 'chatgpt-codex-connector[bot]')
+              .filter(r => r.body && r.body.includes('Codex Review'))
+              .pop();
+
+            const fs = require('fs');
+            fs.writeFileSync('/tmp/claude_review.txt', claudeComment ? claudeComment.body : 'No review');
+            fs.writeFileSync('/tmp/codex_review.txt', codexReview ? codexReview.body : 'No review');
+
+      - name: Claude arbitrates
+        uses: anthropics/claude-code-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed_bots: "claude,chatgpt-codex-connector"
+          direct_prompt: |
+            Two AI reviewers disagreed. Read /tmp/claude_review.txt and /tmp/codex_review.txt.
+            Post a PR comment: ## 🤝 AI Review Consensus: [verdict]
+            Include a table of reviewers and consolidated action items.
+
+      - name: Remove pending labels
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = ${{ inputs.pr_number }};
+            const { data: labels } = await github.rest.issues.listLabelsOnIssue({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber
+            });
+
+            for (const label of labels) {
+              if (label.name.startsWith('awaiting-ai-consensus')) {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  name: label.name
+                });
+              }
+            }

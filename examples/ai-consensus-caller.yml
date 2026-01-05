@@ -1,0 +1,51 @@
+# AI Consensus Review - Caller Workflow
+#
+# Copy this file to your repo at: .github/workflows/ai-consensus.yml
+# This enables Claude + Codex consensus review for your PRs.
+#
+# Prerequisites:
+# 1. Claude GitHub App installed (github.com/apps/claude)
+# 2. ChatGPT Codex Connector installed (github.com/apps/chatgpt-codex-connector)
+# 3. CLAUDE_CODE_OAUTH_TOKEN secret configured (for arbitration)
+#
+# How it works:
+# - Listens for Claude (issue_comment) and Codex (pull_request_review) events
+# - Calls the central consensus workflow in mp3fbf/code-review
+# - That workflow handles consensus logic, arbitration, and auto-fix triggering
+
+name: AI Consensus Review
+
+on:
+  issue_comment:
+    types: [created, edited]
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  # Main consensus check
+  consensus:
+    # Security: Only pass safe values (PR number, event name, username)
+    # The reusable workflow fetches content via API, not from inputs
+    uses: mp3fbf/code-review/.github/workflows/consensus-reusable.yml@main
+    with:
+      event_name: ${{ github.event_name }}
+      pr_number: ${{ github.event_name == 'issue_comment' && github.event.issue.number || github.event.pull_request.number }}
+      trigger_user: ${{ github.event_name == 'issue_comment' && github.event.comment.user.login || github.event.review.user.login }}
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+
+  # Retry/timeout handling
+  retry:
+    uses: mp3fbf/code-review/.github/workflows/retry-reusable.yml@main
+    with:
+      pr_number: ${{ github.event_name == 'issue_comment' && github.event.issue.number || github.event.pull_request.number }}
+
+  # Auto-fix after consensus
+  auto-fix:
+    needs: consensus
+    if: always()
+    uses: mp3fbf/code-review/.github/workflows/autofix-reusable.yml@main
+    with:
+      pr_number: ${{ github.event_name == 'issue_comment' && github.event.issue.number || github.event.pull_request.number }}
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}

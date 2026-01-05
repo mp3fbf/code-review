@@ -1,0 +1,167 @@
+# Auto-Fix - Reusable Workflow
+#
+# Applies review suggestions after consensus is reached.
+#
+# Security:
+# - Only accepts pr_number (integer)
+# - All content fetched via API
+# - Branch name passed via env var (not directly in run: commands)
+# - Review content written to files, not shell variables
+
+name: Auto-Fix (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: 'The PR number'
+        required: true
+        type: number
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+
+jobs:
+  apply-fixes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+
+    steps:
+      # Security: Check consensus via API, not from event payload
+      - name: Check if should apply fixes
+        id: check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = ${{ inputs.pr_number }};
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber
+            });
+
+            const consensus = comments
+              .filter(c => c.user.login === 'github-actions[bot]')
+              .filter(c => c.body.includes('AI Review Consensus'))
+              .pop();
+
+            if (!consensus || !consensus.body.includes('CHANGES REQUESTED')) {
+              core.setOutput('should_fix', 'false');
+              return;
+            }
+
+            const { data: prData } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber
+            });
+
+            const { data: commits } = await github.rest.pulls.listCommits({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber
+            });
+
+            const autoFixCount = commits.filter(c => c.commit.message.includes('[auto-fix]')).length;
+
+            if (autoFixCount >= 3) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: '⚠️ **Auto-fix limit reached (3 iterations)**\n\nPlease review manually.'
+              });
+              core.setOutput('should_fix', 'false');
+              return;
+            }
+
+            core.setOutput('should_fix', 'true');
+            core.setOutput('iteration', String(autoFixCount + 1));
+            core.setOutput('branch', prData.head.ref);
+
+      - name: Post starting comment
+        if: steps.check.outputs.should_fix == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const iteration = '${{ steps.check.outputs.iteration }}';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ inputs.pr_number }},
+              body: '🔄 **Auto-fix iteration ' + iteration + '/3** - Applying review suggestions...'
+            });
+
+      - name: Checkout
+        if: steps.check.outputs.should_fix == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.check.outputs.branch }}
+          fetch-depth: 0
+
+      # Security: Use env var for branch name in run commands
+      - name: Configure git
+        if: steps.check.outputs.should_fix == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Apply fixes with Claude
+        if: steps.check.outputs.should_fix == 'true'
+        uses: anthropics/claude-code-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed_bots: "claude,chatgpt-codex-connector"
+          direct_prompt: |
+            Apply the code review suggestions from the review comments on this PR.
+
+            Focus on:
+            - Security issues (marked with warning symbols)
+            - Bugs (marked with bug symbols)
+            - Performance issues with code suggestions
+
+            Skip:
+            - Items already marked as done
+            - Pure style suggestions
+            - Test recommendations
+
+            After applying:
+            1. Stage changes: git add -A
+            2. Commit: fix: apply review suggestions [auto-fix]
+            3. Include brief list of fixes in commit body
+
+            If nothing actionable, say so.
+
+      - name: Check for changes
+        if: steps.check.outputs.should_fix == 'true'
+        id: changes
+        run: |
+          if git diff --quiet && git diff --staged --quiet; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          fi
+
+      # Security: Branch name passed via env var to prevent injection
+      - name: Push changes
+        if: steps.changes.outputs.has_changes == 'true'
+        env:
+          BRANCH_NAME: ${{ steps.check.outputs.branch }}
+        run: git push origin "HEAD:$BRANCH_NAME"
+
+      - name: Comment if no changes
+        if: steps.check.outputs.should_fix == 'true' && steps.changes.outputs.has_changes == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ inputs.pr_number }},
+              body: '✅ **Auto-fix: Analyzed, no changes needed**\n\nSuggestions were analyzed but did not result in code changes.'
+            });
