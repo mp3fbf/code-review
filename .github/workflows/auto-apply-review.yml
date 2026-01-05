@@ -1,14 +1,17 @@
 # Auto Apply Review Suggestions
 #
-# This workflow automatically applies Claude's code review suggestions.
-# It triggers when claude[bot] edits a comment to add the review content.
+# This workflow automatically applies AI code review suggestions.
+# It triggers when the consensus workflow posts "AI Review Consensus".
 #
 # How it works:
-# 1. Claude Code Review workflow runs on PR push
-# 2. claude-code-action creates a comment and later edits it with the review
-# 3. This workflow triggers on the edit when "Code Review" appears
-# 4. Claude Code applies the suggestions and commits with [auto-fix] tag
-# 5. The push triggers step 1 again (loop until approval or 3 iterations)
+# 1. Claude and Codex review the PR independently
+# 2. consensus-review.yml waits for both and posts "AI Review Consensus"
+# 3. This workflow triggers on that consensus comment
+# 4. Claude Code applies the consolidated suggestions
+# 5. Commits with [auto-fix] tag, loop until approval or 3 iterations
+#
+# Security: This workflow uses contains() for filtering only.
+# No untrusted input is used in shell commands.
 #
 # Observability:
 # - Posts comment when review is approved (nothing to fix)
@@ -20,17 +23,28 @@ name: Auto Apply Review Suggestions
 
 on:
   issue_comment:
-    types: [created, edited]  # claude-code-action EDITS the comment with the review
+    types: [created, edited]
 
 jobs:
   apply-review:
-    # Triggers when Claude bot posts a completed review on a PR
-    # Matches both "Code Review" and "Pull Request Review" (output format varies)
+    # Triggers when:
+    # 1. Consensus workflow posts unified review with issues, OR
+    # 2. Claude bot posts review directly (backward compatibility)
+    # Security: contains() is used for filtering only, not in shell commands
     if: |
       github.event.issue.pull_request &&
-      github.event.comment.user.login == 'claude[bot]' &&
-      contains(github.event.comment.body, 'Claude finished') &&
-      (contains(github.event.comment.body, 'Code Review') || contains(github.event.comment.body, 'Pull Request Review'))
+      (
+        (
+          github.event.comment.user.login == 'github-actions[bot]' &&
+          contains(github.event.comment.body, 'AI Review Consensus') &&
+          contains(github.event.comment.body, 'CHANGES REQUESTED')
+        ) ||
+        (
+          github.event.comment.user.login == 'claude[bot]' &&
+          contains(github.event.comment.body, 'Claude finished') &&
+          (contains(github.event.comment.body, 'Code Review') || contains(github.event.comment.body, 'Pull Request Review'))
+        )
+      )
     runs-on: ubuntu-latest
     permissions:
       contents: write

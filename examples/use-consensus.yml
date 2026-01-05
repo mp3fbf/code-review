@@ -1,0 +1,228 @@
+# AI Consensus Review Setup
+#
+# Copy this file to your repository at .github/workflows/ai-consensus.yml
+# This enables Claude + Codex consensus review for your PRs.
+#
+# Prerequisites:
+# 1. Claude GitHub App installed (github.com/apps/claude)
+# 2. ChatGPT Codex Connector installed (github.com/apps/chatgpt-codex-connector)
+# 3. CLAUDE_CODE_OAUTH_TOKEN secret configured
+#
+# How it works:
+# - Monitors Claude (issue_comment) and Codex (pull_request_review) events
+# - Waits for both reviews before posting consensus
+# - If they disagree, Claude arbitrates
+# - Posts unified "AI Review Consensus" comment
+#
+# Timeout behavior (based on Codex 👀 reaction):
+# - Codex reacted 👀: wait 30 min (started processing)
+# - No Codex activity: wait 5 min (not coming)
+# - Fallback: proceed with available review only
+
+name: AI Consensus Review
+
+on:
+  issue_comment:
+    types: [created, edited]
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  consensus-check:
+    if: |
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request &&
+        github.event.comment.user.login == 'claude[bot]' &&
+        contains(github.event.comment.body, 'Claude finished')
+      ) ||
+      (
+        github.event_name == 'pull_request_review' &&
+        github.event.review.user.login == 'chatgpt-codex-connector[bot]' &&
+        contains(github.event.review.body, 'Codex Review')
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+
+    steps:
+      - name: Run consensus check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Get PR number
+            let prNumber;
+            if (context.eventName === 'issue_comment') {
+              prNumber = context.issue.number;
+            } else {
+              prNumber = context.payload.pull_request.number;
+            }
+
+            // Check for existing consensus
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber
+            });
+
+            if (comments.some(c => c.user.login === 'github-actions[bot]' && c.body.includes('AI Review Consensus'))) {
+              console.log('Consensus already posted');
+              return;
+            }
+
+            // Fetch Claude review
+            const claudeComment = comments
+              .filter(c => c.user.login === 'claude[bot]')
+              .filter(c => c.body.includes('Claude finished'))
+              .pop();
+
+            // Fetch Codex review
+            const { data: reviews } = await github.rest.pulls.listReviews({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber
+            });
+
+            const codexReview = reviews
+              .filter(r => r.user.login === 'chatgpt-codex-connector[bot]')
+              .filter(r => r.body && r.body.includes('Codex Review'))
+              .pop();
+
+            // Determine status
+            const claudeFound = !!claudeComment;
+            const codexFound = !!codexReview;
+
+            if (!claudeFound && !codexFound) {
+              console.log('No reviews found');
+              return;
+            }
+
+            if (!claudeFound || !codexFound) {
+              // One missing - check for 👀 and add label
+              const missing = !claudeFound ? 'claude' : 'codex';
+              let codexStarted = false;
+
+              if (missing === 'codex') {
+                for (const comment of comments) {
+                  try {
+                    const { data: reactions } = await github.rest.reactions.listForIssueComment({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      comment_id: comment.id
+                    });
+                    if (reactions.some(r => r.user.login === 'chatgpt-codex-connector[bot]' && r.content === 'eyes')) {
+                      codexStarted = true;
+                      break;
+                    }
+                  } catch (e) {}
+                }
+              }
+
+              const labelName = missing === 'codex'
+                ? (codexStarted ? 'awaiting-ai-consensus-codex-processing' : 'awaiting-ai-consensus-codex-not-started')
+                : 'awaiting-ai-consensus-claude';
+
+              try {
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: labelName,
+                  color: 'fbca04'
+                });
+              } catch (e) {}
+
+              const { data: labels } = await github.rest.issues.listLabelsOnIssue({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber
+              });
+
+              if (!labels.some(l => l.name.startsWith('awaiting-ai-consensus'))) {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  labels: [labelName]
+                });
+              }
+              console.log(`Waiting for ${missing}, label: ${labelName}`);
+              return;
+            }
+
+            // Both reviews present - analyze
+            const claudeBody = claudeComment.body;
+            const claudeApproves = claudeBody.includes('APPROVED') ||
+                                  claudeBody.includes('Recommendation: MERGE') ||
+                                  claudeBody.includes('Overall Assessment: APPROVED') ||
+                                  claudeBody.includes('Excellent Work');
+            const claudeHasIssues = claudeBody.includes('🔒') || claudeBody.includes('🐛') ||
+                                   (claudeBody.includes('⚠️') && !claudeBody.includes('Auto-fix'));
+
+            const codexBody = codexReview.body;
+            const p1Count = (codexBody.match(/!\[P1 Badge\]/g) || []).length;
+            const codexApproves = p1Count === 0;
+
+            // Determine consensus
+            const claudeFinal = claudeApproves && !claudeHasIssues;
+            const bothAgree = claudeFinal === codexApproves;
+
+            let emoji, verdict, body;
+
+            if (bothAgree) {
+              if (claudeFinal) {
+                emoji = '✅';
+                verdict = 'MERGE RECOMMENDED';
+                body = '**Both AI reviewers agree this PR is ready to merge.**';
+              } else {
+                emoji = '⚠️';
+                verdict = 'CHANGES REQUESTED';
+                body = '**Both AI reviewers found issues that should be addressed.**';
+              }
+            } else {
+              emoji = '🤔';
+              verdict = 'NEEDS ARBITRATION';
+              body = '**Claude and Codex disagree. Manual review recommended.**';
+            }
+
+            const commentBody = [
+              `## ${emoji} AI Review Consensus: ${verdict}`,
+              '',
+              '| Reviewer | Verdict |',
+              '|----------|---------|',
+              `| Claude | ${claudeFinal ? '✅ Approved' : '⚠️ Issues Found'} |`,
+              `| Codex | ${codexApproves ? '✅ No P1 Issues' : '⚠️ ' + p1Count + ' P1 Issue(s)'} |`,
+              '',
+              body,
+              '',
+              '---',
+              '*This is an automated consensus. Final merge decision is yours.*',
+              '*To re-review: comment `@claude review` and/or `@codex review`*'
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: commentBody
+            });
+
+            // Remove pending labels
+            const { data: labels } = await github.rest.issues.listLabelsOnIssue({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber
+            });
+
+            for (const label of labels) {
+              if (label.name.startsWith('awaiting-ai-consensus')) {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  name: label.name
+                });
+              }
+            }
